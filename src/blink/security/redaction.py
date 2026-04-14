@@ -64,6 +64,56 @@ _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# Additional patterns for enhanced detection
+# ---------------------------------------------------------------------------
+
+_ADDITIONAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Private key labels (file content markers)
+    (
+        re.compile(r"-----BEGIN\s+(?:\w+\s+)*PRIVATE KEY-----[\s\S]*?-----END\s+(?:\w+\s+)*PRIVATE KEY-----"),
+        "-----BEGIN PRIVATE KEY----- ***[REDACTED]*** -----END PRIVATE KEY-----",
+    ),
+    # Client secret assignments
+    (
+        re.compile(r"(?i)client[_-]?secret\s*[=:]\s*['\"]?([\w/+\-\.]{6,})['\"]?"),
+        "client_secret=***[REDACTED]***",
+    ),
+    # Database URL with embedded credentials: postgres://user:pass@host or mysql://...
+    (
+        re.compile(r"(?i)(postgres|postgresql|mysql|mariadb|mongodb)://[^:@\s]+:[^@\s]+@"),
+        r"\1://***[REDACTED]***@",
+    ),
+    # mongodb+srv:// DSN
+    (
+        re.compile(r"mongodb\+srv://[^:@\s]+:[^@\s]+@"),
+        "mongodb+srv://***[REDACTED]***@",
+    ),
+    # Generic private_key assignments
+    (
+        re.compile(r"(?i)private[_-]?key\s*[=:]\s*['\"]?([\w/+\-\.]{6,})['\"]?"),
+        "private_key=***[REDACTED]***",
+    ),
+    # JWT tokens: three base64url segments separated by dots
+    (
+        re.compile(r"\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+        "ey***[REDACTED JWT]***",
+    ),
+    # Stripe secret keys: sk_live_... or sk_test_...
+    (
+        re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b"),
+        "sk_***[REDACTED]***",
+    ),
+    # Twilio auth tokens
+    (
+        re.compile(r"\b[0-9a-f]{32}\b"),
+        "***[REDACTED]***",
+    ),
+]
+
+# Merge additional patterns into the primary list
+_SECRET_PATTERNS.extend(_ADDITIONAL_PATTERNS)
+
 # Environment variable name patterns that should always be redacted
 _SENSITIVE_ENV_NAMES = re.compile(
     r"(?i)^(.*)(api[_-]?key|secret|password|passwd|token|credential|auth|private[_-]?key"
