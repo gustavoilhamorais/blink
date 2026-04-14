@@ -257,6 +257,65 @@ def block_show(block_id: str = typer.Argument(..., help="Block ID to display."))
 
 
 # ---------------------------------------------------------------------------
+# mcp subcommand group
+# ---------------------------------------------------------------------------
+
+mcp_app = typer.Typer(help="MCP server commands.")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("serve")
+def mcp_serve(
+    transport: str = typer.Option(
+        "stdio",
+        "--transport",
+        "-t",
+        help="Transport to use: 'stdio' (default) or 'http'.",
+    ),
+    capability: str = typer.Option(
+        "observe",
+        "--capability",
+        "-c",
+        help="Granted capability level: observe, suggest, act, or admin.",
+    ),
+    no_confirm: bool = typer.Option(
+        False,
+        "--no-confirm",
+        help="Disable interactive confirmation for ACT-level tools.",
+    ),
+) -> None:
+    """Start the Blink MCP server.
+
+    Use --transport stdio (default) for local agents.
+    The server communicates via JSON-RPC 2.0 over newline-delimited messages.
+    """
+    import anyio
+
+    from blink.mcp.server import run_server
+    from blink.security.capabilities import Capability, SecurityPolicy
+
+    try:
+        cap = Capability(capability.lower())
+    except ValueError:
+        console.print(
+            f"[red]Unknown capability level:[/red] {capability!r}. "
+            "Choose from: observe, suggest, act, admin."
+        )
+        raise typer.Exit(1) from None
+
+    policy = SecurityPolicy(
+        granted_capability=cap,
+        require_confirmation=not no_confirm,
+    )
+
+    if transport != "stdio":
+        console.print(f"[yellow]Transport '{transport}' is not yet implemented.[/yellow]")
+        raise typer.Exit(1)
+
+    anyio.run(run_server, transport, None, None, policy)
+
+
+# ---------------------------------------------------------------------------
 # provider subcommand group
 # ---------------------------------------------------------------------------
 

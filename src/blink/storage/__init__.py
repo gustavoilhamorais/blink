@@ -54,6 +54,19 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id);
 CREATE INDEX IF NOT EXISTS idx_history_cwd    ON history(cwd);
 CREATE INDEX IF NOT EXISTS idx_history_cmd    ON history(command);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    event     TEXT NOT NULL,
+    tool      TEXT NOT NULL,
+    arguments TEXT,
+    result    TEXT,
+    allowed   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_tool      ON audit_log(tool);
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 """
 
 
