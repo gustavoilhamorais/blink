@@ -1,7 +1,11 @@
-"""Model Context Protocol (MCP) client.
+"""Model Context Protocol (MCP) server and client.
 
-Implements the MCP client side for tool and resource discovery, allowing
-Blink's inline agents to use any MCP-compatible tool server.
+The MCP server (blink.mcp.server) exposes Blink terminal capabilities
+to AI agents via the JSON-RPC 2.0-based MCP specification.
 
 See: https://modelcontextprotocol.io
 """
+
+from blink.mcp.server import AuditLogger, MCPServer, run_server
+
+__all__ = ["MCPServer", "AuditLogger", "run_server"]
