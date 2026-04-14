@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -346,3 +347,321 @@ def provider_remove(
     """Remove an AI provider configuration."""
     console.print(f"[yellow]provider remove {name}[/yellow] — not yet implemented")
     raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# agent subcommand group
+# ---------------------------------------------------------------------------
+
+agent_app = typer.Typer(help="Agent interaction commands.")
+app.add_typer(agent_app, name="agent")
+
+
+def _build_gateway(session_id: str) -> tuple[Any, Any]:
+    """Build a gateway + run_manager pair for CLI agent commands.
+
+    Returns (gateway, run_manager).  Caller is responsible for setting up
+    anyio event loop context.
+    """
+    from blink.acp.gateway import ACPGateway
+    from blink.acp.runs import RunManager
+    from blink.acp.sessions import SessionManager
+    from blink.daemon.app import BlinkDaemon
+    from blink.mcp.server import MCPServer
+    from blink.security.capabilities import Capability, SecurityPolicy
+    from blink.storage import Storage
+
+    # Minimal bootstrap: storage -> daemon -> mcp -> gateway
+    storage = Storage()
+    daemon = BlinkDaemon()
+    policy = SecurityPolicy(
+        granted_capability=Capability.ACT,
+        require_confirmation=True,
+    )
+    mcp_server = MCPServer(daemon=daemon, policy=policy)
+    run_manager = RunManager(storage=storage)
+    session_manager = SessionManager(storage=storage, daemon=daemon)
+    gateway = ACPGateway(
+        mcp_server=mcp_server,
+        providers={},
+        run_manager=run_manager,
+        session_manager=session_manager,
+    )
+    return gateway, run_manager
+
+
+@agent_app.command("ask")
+def agent_ask(
+    prompt: str = typer.Argument(..., help="Prompt to send to the agent."),
+    session_id: str = typer.Option(
+        "",
+        "--session",
+        "-s",
+        help="Blink session ID (defaults to BLINK_SESSION_ID env var).",
+    ),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Wait for full response before printing."),
+) -> None:
+    """Send a prompt to the agent and stream the response."""
+    import anyio
+
+    from blink.acp.gateway import RunMode
+
+    sid = session_id or os.environ.get("BLINK_SESSION_ID", "")
+    if not sid:
+        console.print(
+            "[yellow]No session ID provided.[/yellow] "
+            "Set BLINK_SESSION_ID or pass --session."
+        )
+        raise typer.Exit(1)
+
+    async def _run() -> None:
+        from blink.acp.gateway import ACPGateway
+        from blink.acp.runs import RunManager
+        from blink.acp.sessions import SessionManager
+        from blink.daemon.app import BlinkDaemon
+        from blink.mcp.server import MCPServer
+        from blink.security.capabilities import Capability, SecurityPolicy
+        from blink.storage import Storage
+
+        storage = Storage()
+        await storage.init_db()
+        daemon = BlinkDaemon()
+        await daemon._storage.init_db()
+        policy = SecurityPolicy(
+            granted_capability=Capability.ACT,
+            require_confirmation=True,
+        )
+        mcp_server = MCPServer(daemon=daemon, policy=policy)
+        run_manager = RunManager(storage=storage)
+        session_manager = SessionManager(storage=storage, daemon=daemon)
+        gateway = ACPGateway(
+            mcp_server=mcp_server,
+            providers={},
+            run_manager=run_manager,
+            session_manager=session_manager,
+        )
+
+        mode = RunMode.SYNC if no_stream else RunMode.STREAM
+        run = await gateway.create_run(prompt=prompt, session_id=sid, mode=mode)
+        console.print(f"[dim]Run {run.id[:8]}…[/dim]")
+
+        async for event in await gateway.stream_run(run):
+            if event.type == "text":
+                console.print(str(event.data or ""), end="")
+            elif event.type == "tool_call":
+                data = event.data or {}
+                if isinstance(data, dict):
+                    console.print(f"\n[dim cyan][tool] {data.get('tool', '')}[/dim cyan]")
+            elif event.type == "awaiting":
+                data = event.data or {}
+                if isinstance(data, dict):
+                    action = data.get("action", {})
+                    preview = action.get("preview", "Unknown action") if isinstance(action, dict) else str(action)
+                    console.print(f"\n[yellow][confirm] {preview}[/yellow]")
+                    answer = typer.prompt("Allow? [y/N]", default="N")
+                    run_id = data.get("run_id", run.id)
+                    approved = answer.strip().lower() in {"y", "yes"}
+                    await run_manager.resolve_pending(run_id, approved)
+            elif event.type == "completed":
+                console.print()  # newline after streamed text
+            elif event.type == "error":
+                data = event.data or {}
+                msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
+                console.print(f"\n[red]Error:[/red] {msg}")
+            elif event.type == "cancelled":
+                console.print("\n[yellow]Cancelled.[/yellow]")
+
+        await storage.close()
+        await daemon._storage.close()
+
+    try:
+        anyio.run(_run)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        raise typer.Exit(1) from None
+
+
+@agent_app.command("cancel")
+def agent_cancel(
+    run_id: str = typer.Argument(..., help="Run ID to cancel."),
+) -> None:
+    """Cancel a running agent run."""
+    import anyio
+
+    async def _cancel() -> None:
+        from blink.acp.runs import RunManager
+        from blink.storage import Storage
+
+        storage = Storage()
+        await storage.init_db()
+        run_manager = RunManager(storage=storage)
+        run = await run_manager.get(run_id)
+        if run is None:
+            console.print(f"[red]Run {run_id!r} not found.[/red]")
+            raise typer.Exit(1)
+        if run.is_terminal():
+            console.print(f"[yellow]Run {run_id[:8]}… is already in terminal state: {run.state}[/yellow]")
+        else:
+            await run_manager.cancel(run_id)
+            console.print(f"[green]Run {run_id[:8]}… cancelled.[/green]")
+        await storage.close()
+
+    anyio.run(_cancel)
+
+
+@agent_app.command("status")
+def agent_status(
+    run_id: str = typer.Argument(..., help="Run ID to inspect."),
+) -> None:
+    """Show the status of an agent run."""
+    import anyio
+
+    async def _status() -> None:
+        from blink.acp.runs import RunManager
+        from blink.storage import Storage
+
+        storage = Storage()
+        await storage.init_db()
+        run_manager = RunManager(storage=storage)
+        run = await run_manager.get(run_id)
+        if run is None:
+            console.print(f"[red]Run {run_id!r} not found.[/red]")
+            raise typer.Exit(1)
+        console.print(f"[bold]Run:[/bold] {run.id}")
+        console.print(f"[bold]State:[/bold] {run.state}")
+        console.print(f"[bold]Session:[/bold] {run.session_id}")
+        console.print(f"[bold]Prompt:[/bold] {run.prompt}")
+        console.print(f"[bold]Created:[/bold] {run.created_at.isoformat()}")
+        if run.result:
+            console.print(f"[bold]Result:[/bold] {run.result[:200]}")
+        if run.error:
+            console.print(f"[bold red]Error:[/bold red] {run.error}")
+        if run.pending_action:
+            console.print(f"[bold yellow]Pending:[/bold yellow] {run.pending_action.preview}")
+        await storage.close()
+
+    anyio.run(_status)
+
+
+@agent_app.command("list")
+def agent_list(
+    session_id: str = typer.Option(
+        "",
+        "--session",
+        "-s",
+        help="Session ID to query (defaults to BLINK_SESSION_ID env var).",
+    ),
+    limit: int = typer.Option(10, "--limit", "-n", help="Maximum number of runs to show."),
+) -> None:
+    """List recent agent runs for a session."""
+    import anyio
+
+    sid = session_id or os.environ.get("BLINK_SESSION_ID", "")
+    if not sid:
+        console.print(
+            "[yellow]No session ID provided.[/yellow] "
+            "Set BLINK_SESSION_ID or pass --session."
+        )
+        raise typer.Exit(1)
+
+    async def _list() -> None:
+        from blink.acp.runs import RunManager
+        from blink.storage import Storage
+
+        storage = Storage()
+        await storage.init_db()
+        run_manager = RunManager(storage=storage)
+        runs = await run_manager.list_for_session(sid)
+        runs = runs[:limit]
+
+        if not runs:
+            console.print("[dim]No runs found for this session.[/dim]")
+            await storage.close()
+            return
+
+        table = Table(title=f"Agent runs — session {sid[:8]}…", show_lines=True)
+        table.add_column("Run ID", style="dim", width=10)
+        table.add_column("State", width=14)
+        table.add_column("Prompt")
+        table.add_column("Created", style="dim", width=20)
+
+        state_styles = {
+            "completed": "[green]completed[/green]",
+            "failed": "[red]failed[/red]",
+            "cancelled": "[yellow]cancelled[/yellow]",
+            "in_progress": "[cyan]in_progress[/cyan]",
+            "awaiting_input": "[yellow]awaiting_input[/yellow]",
+            "created": "[dim]created[/dim]",
+        }
+
+        for run in runs:
+            state_display = state_styles.get(run.state, run.state)
+            table.add_row(
+                run.id[:8] + "…",
+                state_display,
+                run.prompt[:60] + ("…" if len(run.prompt) > 60 else ""),
+                run.created_at.isoformat()[:19],
+            )
+
+        console.print(table)
+        await storage.close()
+
+    anyio.run(_list)
+
+
+@agent_app.command("approve")
+def agent_approve(
+    run_id: str = typer.Argument(..., help="Run ID with a pending action to approve."),
+) -> None:
+    """Approve a pending action for a paused agent run."""
+    import anyio
+
+    async def _approve() -> None:
+        from blink.acp.runs import RunManager
+        from blink.storage import Storage
+
+        storage = Storage()
+        await storage.init_db()
+        run_manager = RunManager(storage=storage)
+        run = await run_manager.get(run_id)
+        if run is None:
+            console.print(f"[red]Run {run_id!r} not found.[/red]")
+            raise typer.Exit(1)
+        if run.state != "awaiting_input":
+            console.print(f"[yellow]Run is not awaiting input (state: {run.state})[/yellow]")
+            raise typer.Exit(1)
+        if run.pending_action:
+            console.print(f"[bold]Action:[/bold] {run.pending_action.preview}")
+        updated = await run_manager.resolve_pending(run_id, approved=True)
+        console.print(f"[green]Approved. Run {run_id[:8]}… resumed (state: {updated.state})[/green]")
+        await storage.close()
+
+    anyio.run(_approve)
+
+
+@agent_app.command("deny")
+def agent_deny(
+    run_id: str = typer.Argument(..., help="Run ID with a pending action to deny."),
+) -> None:
+    """Deny a pending action for a paused agent run."""
+    import anyio
+
+    async def _deny() -> None:
+        from blink.acp.runs import RunManager
+        from blink.storage import Storage
+
+        storage = Storage()
+        await storage.init_db()
+        run_manager = RunManager(storage=storage)
+        run = await run_manager.get(run_id)
+        if run is None:
+            console.print(f"[red]Run {run_id!r} not found.[/red]")
+            raise typer.Exit(1)
+        if run.state != "awaiting_input":
+            console.print(f"[yellow]Run is not awaiting input (state: {run.state})[/yellow]")
+            raise typer.Exit(1)
+        await run_manager.resolve_pending(run_id, approved=False)
+        console.print(f"[yellow]Denied. Run {run_id[:8]}… cancelled.[/yellow]")
+        await storage.close()
+
+    anyio.run(_deny)
